@@ -21,9 +21,21 @@
 (define-constant err-insufficient-participants (err u116))
 (define-constant err-challenge-already-completed (err u117))
 (define-constant err-not-challenge-creator (err u118))
+(define-constant err-bond-not-found (err u119))
+(define-constant err-bond-not-active (err u120))
+(define-constant err-bond-already-funded (err u121))
+(define-constant err-insufficient-funding (err u122))
+(define-constant err-bond-expired (err u123))
+(define-constant err-not-bond-creator (err u124))
+(define-constant err-already-funded-bond (err u125))
+(define-constant err-minimum-funding-not-met (err u126))
+(define-constant err-bond-not-ready-for-payout (err u127))
+(define-constant err-impact-already-verified (err u128))
+(define-constant err-bond-outcome-not-achieved (err u129))
 
 (define-data-var last-token-id uint u0)
 (define-data-var last-challenge-id uint u0)
+(define-data-var last-bond-id uint u0)
 (define-data-var total-contributions uint u0)
 
 (define-map token-count principal uint)
@@ -89,6 +101,43 @@
     submission-block: uint,
     verified: bool,
     verifier: (optional principal)
+})
+
+;; Impact Bonds System - Community-funded outcome-based civic projects
+(define-map impact-bonds uint {
+    creator: principal,
+    title: (string-utf8 100),
+    description: (string-utf8 500),
+    category: (string-ascii 50),
+    target-funding: uint,
+    current-funding: uint,
+    outcome-metric: (string-utf8 200),
+    target-outcome: uint,
+    current-outcome: uint,
+    payout-rate: uint, ;; percentage return for funders (basis points)
+    creation-block: uint,
+    funding-deadline: uint,
+    outcome-deadline: uint,
+    status: (string-ascii 20), ;; "funding", "active", "completed", "failed", "expired"
+    is-outcome-verified: bool,
+    total-funders: uint,
+    reputation-bonus: uint
+})
+
+(define-map bond-funders {bond-id: uint, funder: principal} {
+    amount-funded: uint,
+    funding-block: uint,
+    reward-claimed: bool,
+    proportional-share: uint ;; basis points of total funding
+})
+
+(define-map bond-outcomes uint {
+    bond-id: uint,
+    outcome-value: uint,
+    verification-block: uint,
+    verifier: principal,
+    evidence: (string-utf8 300),
+    achievement-percentage: uint
 })
 
 (define-public (initialize-contract)
@@ -510,3 +559,276 @@
 (define-read-only (get-active-challenges)
     (var-get last-challenge-id)
 )
+
+;; Impact Bonds System Functions
+
+(define-public (create-impact-bond 
+    (title (string-utf8 100))
+    (description (string-utf8 500))
+    (category (string-ascii 50))
+    (target-funding uint)
+    (outcome-metric (string-utf8 200))
+    (target-outcome uint)
+    (payout-rate uint)
+    (funding-duration-blocks uint)
+    (outcome-duration-blocks uint)
+    (reputation-bonus uint))
+    (let
+        (
+            (bond-id (+ (var-get last-bond-id) u1))
+            (current-block stacks-block-height)
+            (funding-deadline (+ current-block funding-duration-blocks))
+            (outcome-deadline (+ funding-deadline outcome-duration-blocks))
+            (user-rep (default-to {total-score: u0, contribution-count: u0, verified-contributions: u0, reputation-level: "newcomer", last-contribution: u0} (map-get? user-reputation tx-sender)))
+        )
+        ;; Require minimum reputation to create bonds
+        (asserts! (>= (get total-score user-rep) u50) err-insufficient-reputation)
+        (asserts! (>= target-funding u1000000) (err u130)) ;; Minimum 0.01 STX
+        (asserts! (>= target-outcome u1) (err u131))
+        (asserts! (<= payout-rate u2000) (err u132)) ;; Max 20% return
+        (asserts! (>= payout-rate u500) (err u133)) ;; Min 5% return
+        
+        (var-set last-bond-id bond-id)
+        (map-set impact-bonds bond-id {
+            creator: tx-sender,
+            title: title,
+            description: description,
+            category: category,
+            target-funding: target-funding,
+            current-funding: u0,
+            outcome-metric: outcome-metric,
+            target-outcome: target-outcome,
+            current-outcome: u0,
+            payout-rate: payout-rate,
+            creation-block: current-block,
+            funding-deadline: funding-deadline,
+            outcome-deadline: outcome-deadline,
+            status: "funding",
+            is-outcome-verified: false,
+            total-funders: u0,
+            reputation-bonus: reputation-bonus
+        })
+        (ok bond-id)
+    )
+)
+
+(define-public (fund-impact-bond (bond-id uint) (amount uint))
+    (let
+        (
+            (bond (unwrap! (map-get? impact-bonds bond-id) err-bond-not-found))
+            (current-block stacks-block-height)
+            (funder-key {bond-id: bond-id, funder: tx-sender})
+            (existing-funding (map-get? bond-funders funder-key))
+            (new-total-funding (+ (get current-funding bond) amount))
+            (user-rep (default-to {total-score: u0, contribution-count: u0, verified-contributions: u0, reputation-level: "newcomer", last-contribution: u0} (map-get? user-reputation tx-sender)))
+        )
+        ;; Validation checks
+        (asserts! (is-eq (get status bond) "funding") err-bond-not-active)
+        (asserts! (<= current-block (get funding-deadline bond)) err-bond-expired)
+        (asserts! (>= (get total-score user-rep) u10) err-insufficient-reputation)
+        (asserts! (>= amount u100000) (err u134)) ;; Minimum 0.001 STX funding
+        (asserts! (<= new-total-funding (get target-funding bond)) err-insufficient-funding)
+        
+        ;; Transfer STX to contract
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        
+        ;; Update or create funder record
+        (match existing-funding
+            existing-data
+            (let
+                (
+                    (new-amount (+ (get amount-funded existing-data) amount))
+                    (new-share (/ (* new-amount u10000) new-total-funding))
+                )
+                (map-set bond-funders funder-key (merge existing-data {
+                    amount-funded: new-amount,
+                    proportional-share: new-share
+                }))
+            )
+            (let
+                (
+                    (share (/ (* amount u10000) new-total-funding))
+                )
+                (map-set bond-funders funder-key {
+                    amount-funded: amount,
+                    funding-block: current-block,
+                    reward-claimed: false,
+                    proportional-share: share
+                })
+                (map-set impact-bonds bond-id (merge bond {
+                    total-funders: (+ (get total-funders bond) u1)
+                }))
+            )
+        )
+        
+        ;; Update bond funding
+        (map-set impact-bonds bond-id (merge bond {
+            current-funding: new-total-funding,
+            status: (if (>= new-total-funding (get target-funding bond)) "active" "funding")
+        }))
+        
+        (ok new-total-funding)
+    )
+)
+
+(define-public (verify-bond-outcome (bond-id uint) (outcome-value uint) (evidence (string-utf8 300)))
+    (let
+        (
+            (bond (unwrap! (map-get? impact-bonds bond-id) err-bond-not-found))
+            (current-block stacks-block-height)
+            (is-verifier (default-to false (map-get? verifiers tx-sender)))
+            (achievement-percentage (/ (* outcome-value u10000) (get target-outcome bond)))
+        )
+        ;; Only verifiers can verify outcomes
+        (asserts! is-verifier err-owner-only)
+        (asserts! (is-eq (get status bond) "active") err-bond-not-active)
+        (asserts! (> current-block (get outcome-deadline bond)) err-bond-expired)
+        (asserts! (not (get is-outcome-verified bond)) err-impact-already-verified)
+        
+        ;; Record outcome verification
+        (map-set bond-outcomes bond-id {
+            bond-id: bond-id,
+            outcome-value: outcome-value,
+            verification-block: current-block,
+            verifier: tx-sender,
+            evidence: evidence,
+            achievement-percentage: achievement-percentage
+        })
+        
+        ;; Update bond status based on outcome achievement
+        (map-set impact-bonds bond-id (merge bond {
+            current-outcome: outcome-value,
+            is-outcome-verified: true,
+            status: (if (>= outcome-value (get target-outcome bond)) "completed" "failed")
+        }))
+        
+        ;; Award reputation bonus to bond creator if successful
+        (if (>= outcome-value (get target-outcome bond))
+            (begin
+                (update-user-reputation (get creator bond) (get reputation-bonus bond) true)
+                (ok true)
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (claim-bond-rewards (bond-id uint))
+    (let
+        (
+            (bond (unwrap! (map-get? impact-bonds bond-id) err-bond-not-found))
+            (funder-key {bond-id: bond-id, funder: tx-sender})
+            (funder-data (unwrap! (map-get? bond-funders funder-key) err-already-funded-bond))
+            (outcome-data (unwrap! (map-get? bond-outcomes bond-id) err-bond-not-ready-for-payout))
+            (achievement-rate (get achievement-percentage outcome-data))
+            (base-return (get amount-funded funder-data))
+            (bonus-return (/ (* base-return (get payout-rate bond) achievement-rate) u1000000))
+            (total-return (+ base-return bonus-return))
+        )
+        ;; Validation checks
+        (asserts! (get is-outcome-verified bond) err-bond-not-ready-for-payout)
+        (asserts! (not (get reward-claimed funder-data)) (err u135))
+        (asserts! (>= achievement-rate u1000) err-bond-outcome-not-achieved) ;; At least 10% achievement
+        
+        ;; Mark reward as claimed
+        (map-set bond-funders funder-key (merge funder-data {
+            reward-claimed: true
+        }))
+        
+        ;; Transfer rewards back to funder
+        (try! (as-contract (stx-transfer? total-return tx-sender tx-sender)))
+        
+        ;; Award reputation points for successful funding
+        (let
+            (
+                (rep-reward (/ (get amount-funded funder-data) u100000)) ;; 1 point per 0.001 STX
+            )
+            (update-user-reputation tx-sender rep-reward true)
+        )
+        
+        (ok total-return)
+    )
+)
+
+(define-public (reclaim-failed-bond-funding (bond-id uint))
+    (let
+        (
+            (bond (unwrap! (map-get? impact-bonds bond-id) err-bond-not-found))
+            (funder-key {bond-id: bond-id, funder: tx-sender})
+            (funder-data (unwrap! (map-get? bond-funders funder-key) err-already-funded-bond))
+            (current-block stacks-block-height)
+        )
+        ;; Can only reclaim if bond failed funding deadline or outcome target
+        (asserts! (or 
+            (and (> current-block (get funding-deadline bond)) 
+                 (< (get current-funding bond) (get target-funding bond)))
+            (and (get is-outcome-verified bond) 
+                 (is-eq (get status bond) "failed"))) err-bond-not-ready-for-payout)
+        (asserts! (not (get reward-claimed funder-data)) (err u135))
+        
+        ;; Mark as reclaimed
+        (map-set bond-funders funder-key (merge funder-data {
+            reward-claimed: true
+        }))
+        
+        ;; Return original funding
+        (try! (as-contract (stx-transfer? (get amount-funded funder-data) tx-sender tx-sender)))
+        
+        (ok (get amount-funded funder-data))
+    )
+)
+
+(define-public (close-expired-bond (bond-id uint))
+    (let
+        (
+            (bond (unwrap! (map-get? impact-bonds bond-id) err-bond-not-found))
+            (current-block stacks-block-height)
+        )
+        ;; Only creator or contract owner can close
+        (asserts! (or (is-eq tx-sender (get creator bond)) (is-eq tx-sender contract-owner)) err-not-bond-creator)
+        ;; Must be past both deadlines
+        (asserts! (> current-block (get outcome-deadline bond)) err-bond-expired)
+        
+        (map-set impact-bonds bond-id (merge bond {
+            status: "expired"
+        }))
+        (ok true)
+    )
+)
+
+;; Read-only functions for impact bonds
+
+(define-read-only (get-bond-details (bond-id uint))
+    (map-get? impact-bonds bond-id)
+)
+
+(define-read-only (get-bond-funder-data (bond-id uint) (funder principal))
+    (map-get? bond-funders {bond-id: bond-id, funder: funder})
+)
+
+(define-read-only (get-bond-outcome (bond-id uint))
+    (map-get? bond-outcomes bond-id)
+)
+
+(define-read-only (get-last-bond-id)
+    (var-get last-bond-id)
+)
+
+(define-read-only (calculate-potential-return (bond-id uint) (funding-amount uint))
+    (match (map-get? impact-bonds bond-id)
+        bond-data
+        (let
+            (
+                (payout-rate (get payout-rate bond-data))
+                (max-bonus (/ (* funding-amount payout-rate) u10000))
+            )
+            (ok {
+                base-return: funding-amount,
+                max-bonus: max-bonus,
+                total-max-return: (+ funding-amount max-bonus)
+            })
+        )
+        (err err-bond-not-found)
+    )
+)
+
